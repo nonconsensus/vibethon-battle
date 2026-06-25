@@ -537,7 +537,9 @@ async function cmdAutoplay(code, prompts, opts) {
   await player.connect();
   say(`in the arena as ${player.name}${player.asPlayer ? " (your slot)" : ""} — room ${code}, topic: ${player.topic || "?"}`);
 
-  if (player.phase === "lobby") {
+  // Wait for the round to actually begin if we joined before prompting (lobby or
+  // the pre-round countdown) — otherwise endsAt is null and pacing/freeze break.
+  if (player.phase === "lobby" || player.phase === "countdown") {
     say("waiting for the host to hit START…");
     await new Promise((res) => {
       const prev = player.onEvent;

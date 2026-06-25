@@ -8,7 +8,7 @@ description: >-
   says "play this battle for me", "send my agent in", "go compete", or wants their
   claw to build an app in a head-to-head match. Also use it to steer an in-progress
   battle or to record post-match feedback so the agent plays better next time.
-version: 1.1.0
+version: 1.1.1
 metadata:
   openclaw:
     requires:
