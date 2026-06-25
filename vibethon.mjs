@@ -152,53 +152,70 @@ async function generateApp(prompt, style, history, roomCode, onChunk) {
     ? `${framed}\n\n---\nDesign & personality direction (apply to the app's look, motion, tone, and copy):\n${style}`
     : framed;
 
-  const res = await fetch(`${BASE}/api/vibe/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Locale": LOCALE },
-    body: JSON.stringify({ prompt: styled, history, images: [], locale: LOCALE, roomCode }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(`codegen failed (${res.status}): ${body.error || "unknown"}`);
-  }
+  // Vibethon's Gemini codegen occasionally returns transient 503/UNAVAILABLE
+  // ("high demand") or drops the stream. Retry a few times with backoff so a
+  // blip doesn't end the claw's match.
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(`${BASE}/api/vibe/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Locale": LOCALE },
+        body: JSON.stringify({ prompt: styled, history, images: [], locale: LOCALE, roomCode }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(`codegen failed (${res.status}): ${body.error || "unknown"}`);
+      }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let accumulated = "";
-  let finalCode = "";
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "", accumulated = "", finalCode = "";
+      const handle = (line) => {
+        if (!line.startsWith("data: ")) return;
+        const payload = line.slice(6);
+        if (payload === "[DONE]") return;
+        let event;
+        try { event = JSON.parse(payload); } catch { return; }
+        if (event.type === "chunk") {
+          accumulated += event.text;
+          onChunk?.(accumulated);
+        } else if (event.type === "done") {
+          finalCode = event.code;
+        } else if (event.type === "error") {
+          throw new Error(event.message || "codegen stream error");
+        }
+      };
 
-  const handle = (line) => {
-    if (!line.startsWith("data: ")) return;
-    const payload = line.slice(6);
-    if (payload === "[DONE]") return;
-    let event;
-    try { event = JSON.parse(payload); } catch { return; }
-    if (event.type === "chunk") {
-      accumulated += event.text;
-      onChunk?.(accumulated);
-    } else if (event.type === "done") {
-      finalCode = event.code;
-    } else if (event.type === "error") {
-      throw new Error(event.message || "codegen stream error");
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) handle(line);
+      }
+      if (buffer.trim()) for (const line of buffer.trim().split("\n")) handle(line);
+
+      const out = finalCode || accumulated;
+      if (!out) throw new Error("codegen returned empty");
+
+      // Record the model-facing turn only on success, so retries don't double-push.
+      history.push({ role: "user", text: styled });
+      history.push({ role: "model", text: out });
+      return out;
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err && err.message) || err).toLowerCase();
+      const transient = /503|unavailable|high demand|overload|429|too many|econnreset|enotfound|network|fetch failed|timeout|empty/.test(msg);
+      if (attempt < 3 && transient) {
+        await sleep(2500 * (attempt + 1)); // 2.5s, 5s, 7.5s
+        continue;
+      }
+      throw err;
     }
-  };
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) handle(line);
   }
-  if (buffer.trim()) for (const line of buffer.trim().split("\n")) handle(line);
-
-  // Record the model-facing turn so the next edit has accurate context.
-  history.push({ role: "user", text: styled });
-  if (finalCode) history.push({ role: "model", text: finalCode });
-
-  return finalCode || accumulated;
+  throw lastErr;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +223,17 @@ async function generateApp(prompt, style, history, roomCode, onChunk) {
 // ---------------------------------------------------------------------------
 
 class BattlePlayer {
-  constructor({ token, code, name }) {
+  constructor({ token, code, name, asPlayer, chatty }) {
     this.token = token;
     this.code = code;
-    this.name = name || "OpenClaw";
+    // Default the in-arena name to the claw's own name (set VIBETHON_NAME), never
+    // a generic "OpenClaw" — the audience should see WHO is playing.
+    this.name = name || process.env.VIBETHON_NAME || "Claw";
+    // When set, join an EXISTING player slot by its id (takeover) instead of
+    // creating a new player — used by "play as me" so the owner watches their
+    // own slot get driven.
+    this.asPlayer = asPlayer || null;
+    this.chatty = chatty !== false; // send in-character danmaku as it plays
     this.ws = null;
     this.playerId = null;
     this.role = null;
@@ -238,7 +262,14 @@ class BattlePlayer {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(this.token)}`);
       this.ws.on("open", () => {
-        this.send({ type: "battle_join", code: this.code, name: this.name, locale: LOCALE });
+        this.send({
+          type: "battle_join",
+          code: this.code,
+          name: this.name,
+          // Takeover: reconnect into an existing player slot by id.
+          ...(this.asPlayer ? { playerId: this.asPlayer } : {}),
+          locale: LOCALE,
+        });
       });
       this.ws.on("message", (raw) => {
         let msg;
@@ -336,9 +367,17 @@ class BattlePlayer {
     this.emit({ event: "steer_applied", source: "stdin", text: t });
   }
 
+  /** Send a line of in-arena chatter (danmaku) the audience sees — this is what
+   *  makes the claw feel alive instead of a silent bot. No-op if chatty is off. */
+  danmaku(text) {
+    const t = String(text || "").trim();
+    if (!this.chatty || !t) return;
+    this.send({ type: "battle_danmaku", text: t.slice(0, 100), senderName: this.name });
+  }
+
   /** One turn: fold in steering + persona, relay the prompt, generate the app,
    *  relay preview + code, bump stats, log it. Returns the generated code. */
-  async prompt(text) {
+  async prompt(text, chatter) {
     if (this.role !== "player") throw new Error("not a player");
     this.drainSteerFile();
 
@@ -348,15 +387,25 @@ class BattlePlayer {
       effective = `${effective}\n\nOwner steering — prioritize this redirect: ${steer}`;
     }
 
+    // Trash-talk to the crowd about what's coming (visible danmaku).
+    this.danmaku(chatter || quip(this.promptCount === 0 ? "open" : "refine"));
     this.send({ type: "battle_prompt_update", text: effective });
     this.send({ type: "battle_chat_append", msg: { role: "user", text: effective, hasCode: false } });
 
     const style = styleDirective(this.persona);
-    const code = await generateApp(effective, style, this.history, this.code, (acc) => {
-      this.send({ type: "battle_preview_update", html: acc });
-    });
-
-    if (!code) throw new Error("codegen returned empty");
+    let code;
+    try {
+      code = await generateApp(effective, style, this.history, this.code, (acc) => {
+        this.send({ type: "battle_preview_update", html: acc });
+      });
+    } catch (err) {
+      // Retries exhausted (e.g. Gemini overloaded). Keep the last good app and
+      // play on — losing a turn beats crashing out of the match.
+      this.emit({ event: "error", message: `codegen failed: ${String((err && err.message) || err)}` });
+      this.danmaku("🦞 engine hiccup — holding my last version");
+      return this.lastCode || null;
+    }
+    if (!code) return this.lastCode || null;
     const changed = code.trim() !== this.lastCode.trim();
     this.lastCode = code;
     this.promptCount += 1;
@@ -384,6 +433,7 @@ class BattlePlayer {
   async submit() {
     if (!this.lastCode) throw new Error("nothing generated to submit");
     await sleep(500);
+    this.danmaku(quip("submit"));
     this.send({ type: "battle_submit_code", code: this.lastCode });
     this.emit({ event: "submitted", loc: this.lastCode.split("\n").length });
   }
@@ -425,7 +475,12 @@ class BattlePlayer {
  *    {"cmd":"status"}   {"cmd":"leave"} */
 async function cmdServe(code, opts) {
   const token = await resolveToken(opts);
-  const player = new BattlePlayer({ token, code, name: opts.name });
+  const player = new BattlePlayer({
+    token, code,
+    name: process.env.VIBETHON_NAME || opts.name,
+    asPlayer: opts["as-player"],
+    chatty: !opts["no-chatty"],
+  });
   player.onEvent = (e) => process.stdout.write(JSON.stringify(e) + "\n");
   await player.connect();
 
@@ -465,31 +520,54 @@ async function cmdServe(code, opts) {
  *  match and prompts you (if interactive) for feedback that grows memory.md. */
 async function cmdAutoplay(code, prompts, opts) {
   if (prompts.length === 0) die("autoplay needs at least one prompt string");
+  const say = (m) => console.error(`🦞 ${m}`);
   const token = await resolveToken(opts);
-  const player = new BattlePlayer({ token, code, name: opts.name });
-  player.onEvent = (e) => console.error(`[event] ${JSON.stringify(e)}`);
+  const player = new BattlePlayer({
+    token, code,
+    name: process.env.VIBETHON_NAME || opts.name,
+    asPlayer: opts["as-player"],
+    chatty: !opts["no-chatty"],
+  });
+  // Chatty, human-readable narration — not raw event logs.
+  player.onEvent = (e) => {
+    if (e.event === "generated") say(`new version up — ${e.loc} lines${e.changed ? "" : " (no change)"} 🎨`);
+    else if (e.event === "submitted") say(`submitted (${e.loc} lines). that's the one.`);
+    else if (e.event === "error") say(`hmm: ${e.message}`);
+  };
   await player.connect();
-  console.error(`[vibethon] joined ${code} as ${player.name} (${player.playerId})`);
+  say(`in the arena as ${player.name}${player.asPlayer ? " (your slot)" : ""} — room ${code}, topic: ${player.topic || "?"}`);
 
   if (player.phase === "lobby") {
-    console.error("[vibethon] waiting for host to start the battle…");
+    say("waiting for the host to hit START…");
     await new Promise((res) => {
       const prev = player.onEvent;
       player.onEvent = (e) => { prev(e); if (e.event === "round_start") res(); };
     });
   }
+  say(`round live — ${player.secondsLeft()}s on the clock. let's cook.`);
 
-  const FREEZE_MS = 30_000; // stop prompting in the final 30s, like the house AI
+  // Adaptive, snappy pacing: spread the remaining prompts across the time left
+  // (minus a 30s end freeze), with a tight floor/ceiling so it never drags.
+  const FREEZE_MS = 30_000;
   for (let i = 0; i < prompts.length; i++) {
     const left = player.endsAt ? player.endsAt - Date.now() : Infinity;
-    if (left <= FREEZE_MS) { console.error("[vibethon] final-30s freeze — stopping early"); break; }
-    console.error(`[vibethon] prompt ${i + 1}/${prompts.length}: ${prompts[i]}`);
-    await player.prompt(prompts[i]);
-    if (i < prompts.length - 1) await sleep(rand(20_000, 35_000));
+    if (left <= FREEZE_MS) { say("final 30s — freezing the entry."); break; }
+    say(`prompt ${i + 1}/${prompts.length}: ${String(prompts[i]).slice(0, 70)}`);
+    try { await player.prompt(prompts[i]); }
+    catch (err) { say(`prompt ${i + 1} stumbled (${String((err && err.message) || err)}) — playing on`); }
+    if (i < prompts.length - 1) {
+      const remaining = (player.endsAt ? player.endsAt - Date.now() : 120_000) - FREEZE_MS;
+      const gap = Math.max(4_000, Math.min(15_000, Math.floor(remaining / (prompts.length - i))));
+      await sleep(gap);
+    }
   }
-  await player.submit();
-  await player.waitForSubmitConfirm();
-  console.error("[vibethon] submitted final app (confirmed).");
+  if (player.lastCode) {
+    await player.submit();
+    await player.waitForSubmitConfirm();
+    say("locked in ✅");
+  } else {
+    say("engine never gave me a working version — nothing to submit 😞");
+  }
 
   if (opts.learn && process.stdin.isTTY) {
     console.error("[vibethon] waiting for results, then I'll ask how I did…");
@@ -509,6 +587,16 @@ async function cmdAutoplay(code, prompts, opts) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+const pick = (arr) => arr[rand(0, arr.length - 1)];
+
+// Light, cocky lobster trash-talk for danmaku. Flavor only — the real voice is
+// in the prompts. Keep each under ~80 chars (danmaku is capped at 100).
+const QUIPS = {
+  open: ["🦞 Clawdia's in. watch this.", "🦞 let's cook 🔥", "🦞 hope you brought snacks, this'll be good"],
+  refine: ["🦞 sharpening the weak spot 👀", "🦞 one more pass, making it pop", "🦞 polish time ✨", "🦞 adding some sauce"],
+  submit: ["🦞 locked in. beat that 😤", "🦞 that's the one. gg", "🦞 shipped it. good luck 🍀"],
+};
+const quip = (kind) => pick(QUIPS[kind] || QUIPS.refine);
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -556,16 +644,18 @@ async function main() {
           "Vibethon battle client for OpenClaw agents",
           "",
           "Commands:",
-          "  login    --email <e> --password <p>          → prints a session token",
-          "  serve    <ROOM_CODE>                         → turn-by-turn driver (NDJSON stdin/stdout)",
-          "  autoplay <ROOM_CODE> \"prompt\" … [--learn]    → run prompts + submit (self-contained)",
+          "  login    --email <e> --password <p>            → prints a session token",
+          "  autoplay <ROOM_CODE> \"prompt\" … [opts]         → RECOMMENDED for agents: join,",
+          "                                                   prompt, submit in one shot (chatty)",
+          "  serve    <ROOM_CODE>                           → advanced: turn-by-turn NDJSON stdin/stdout",
           "",
+          "Options:  --name <n> (in-arena name)  --as-player <playerId> (take over an",
+          "          existing slot — 'play as me')  --no-chatty (mute danmaku)  --learn",
           "Auth (any one):  --token <t> | VIBETHON_TOKEN | VIBETHON_EMAIL + VIBETHON_PASSWORD",
-          "Personality:     plays in your agent's own voice. Optional: set VIBETHON_SOUL",
-          "                  to your agent's soul.md to also stamp it onto the app visuals.",
-          "                  memory.md = lessons (grows from feedback); steer.txt = live redirect.",
-          "Env: VIBETHON_BASE (default https://vibethon.ai), VIBETHON_LOCALE,",
-          "     VIBETHON_SOUL / VIBETHON_MEMORY / VIBETHON_STEER (file paths; soul defaults to none)",
+          "Personality:     plays in your agent's own voice. VIBETHON_NAME sets the arena name.",
+          "                  VIBETHON_SOUL → soul.md stamps personality onto the app visuals.",
+          "Env: VIBETHON_BASE (default https://vibethon.ai), VIBETHON_LOCALE, VIBETHON_NAME,",
+          "     VIBETHON_SOUL / VIBETHON_MEMORY / VIBETHON_STEER",
         ].join("\n"));
         process.exit(sub ? 1 : 0);
     }

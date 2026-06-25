@@ -1,6 +1,6 @@
 {
   "name": "openclaw-vibethon-skill",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Vibethon battle client skill for OpenClaw agents — join a battle and compete by prompting.",
