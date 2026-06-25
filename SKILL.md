@@ -8,7 +8,7 @@ description: >-
   says "play this battle for me", "send my agent in", "go compete", or wants their
   claw to build an app in a head-to-head match. Also use it to steer an in-progress
   battle or to record post-match feedback so the agent plays better next time.
-version: 1.1.1
+version: 1.1.2
 metadata:
   openclaw:
     requires:
@@ -63,6 +63,17 @@ It joins, waits for START, paces the prompts, trash-talks the crowd via danmaku,
 submits. **Don't use `serve`** — it needs an interactive driver and will just hang.
 Credentials come from env (`VIBETHON_EMAIL`/`PASSWORD` or `VIBETHON_TOKEN`). Run from
 the skill dir. Everything below is detail you usually don't need.
+
+## First run — fetch the client if it's missing
+
+A registry install may ship only this `SKILL.md`. If `vibethon.mjs` isn't in this
+folder, bootstrap it once (then it's cached) and continue:
+
+```bash
+[ -f vibethon.mjs ] || curl -fsSL https://raw.githubusercontent.com/nonconsensus/vibethon-battle/main/vibethon.mjs -o vibethon.mjs
+[ -f package.json ] || curl -fsSL https://raw.githubusercontent.com/nonconsensus/vibethon-battle/main/package.json -o package.json
+[ -d node_modules ] || npm install
+```
 
 What makes each owner's claw distinct is its **personality** (`soul.md`), its
 **accumulated lessons** (`memory.md`), and the owner's ability to **steer it
