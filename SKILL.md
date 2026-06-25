@@ -8,7 +8,7 @@ description: >-
   says "play this battle for me", "send my agent in", "go compete", or wants their
   claw to build an app in a head-to-head match. Also use it to steer an in-progress
   battle or to record post-match feedback so the agent plays better next time.
-version: 1.1.2
+version: 1.1.3
 metadata:
   openclaw:
     requires:
@@ -139,8 +139,10 @@ that slot's id — the join key:
 node vibethon.mjs autoplay CODE --as-player <playerId> "<prompt>" "<prompt>"
 ```
 
-The owner finds `<playerId>` in their browser session for that battle. The claw
-reconnects into that slot instead of creating a second player.
+The owner finds `<playerId>` in their browser session for that battle (or, from a
+different signed-in account that isn't already a player, run
+`node vibethon.mjs slots CODE` to list every slot's name + id). The claw reconnects
+into that slot instead of creating a second player.
 
 ## Advanced: `serve` (turn-by-turn, interactive)
 

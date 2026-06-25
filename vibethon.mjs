@@ -515,6 +515,34 @@ async function cmdServe(code, opts) {
   player.close();
 }
 
+/** slots: list a room's players (id + name + role) without taking a slot, so you
+ *  can find the playerId to take over with --as-player ("play as me"). */
+async function cmdSlots(code, opts) {
+  const token = await resolveToken(opts); // spectating requires a signed-in account
+  const ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
+  const room = await new Promise((res, rej) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; res(v); } };
+    ws.on("open", () => ws.send(JSON.stringify({ type: "battle_spectate", code, name: "slots-peek", locale: LOCALE })));
+    ws.on("message", (raw) => {
+      try {
+        const m = JSON.parse(raw.toString());
+        if (m.type === "battle_room_state") finish(m.room);
+        else if (m.type === "battle_error" && !done) { done = true; rej(new Error(m.message)); }
+      } catch { /* ignore */ }
+    });
+    ws.on("error", rej);
+    setTimeout(() => finish(null), 6000);
+  });
+  ws.close();
+  if (!room) die(`couldn't read room ${code} (bad code, or not signed in?)`);
+  console.error(`Room ${room.code} — phase ${room.phase}, topic: ${room.config?.topic || "?"}`);
+  console.error("Players (pass an id to --as-player to drive that slot):");
+  for (const p of room.players) {
+    console.error(`  ${String(p.role).padEnd(9)} ${String(p.name).padEnd(16)} id=${p.id}${p.isAI ? " 🤖" : ""}`);
+  }
+}
+
 /** autoplay: run a fixed list of prompts with simple pacing, then submit.
  *  Self-contained — no agent needed. With --learn it stays connected after the
  *  match and prompts you (if interactive) for feedback that grows memory.md. */
@@ -635,6 +663,9 @@ async function main() {
       case "serve":
         await cmdServe(positional[0] || die("usage: vibethon serve <ROOM_CODE>"), opts);
         break;
+      case "slots":
+        await cmdSlots(positional[0] || die("usage: vibethon slots <ROOM_CODE>"), opts);
+        break;
       case "autoplay": {
         const [code, ...prompts] = positional;
         if (!code) die('usage: vibethon autoplay <ROOM_CODE> "prompt 1" "prompt 2" …');
@@ -651,8 +682,11 @@ async function main() {
           "                                                   prompt, submit in one shot (chatty)",
           "  serve    <ROOM_CODE>                           → advanced: turn-by-turn NDJSON stdin/stdout",
           "",
+          "  slots    <ROOM_CODE>                           → list players + ids (find the",
+          "                                                   --as-player join key)",
+          "",
           "Options:  --name <n> (in-arena name)  --as-player <playerId> (take over an",
-          "          existing slot — 'play as me')  --no-chatty (mute danmaku)  --learn",
+          "          existing slot — 'play as me'; find ids with `slots`)  --no-chatty  --learn",
           "Auth (any one):  --token <t> | VIBETHON_TOKEN | VIBETHON_EMAIL + VIBETHON_PASSWORD",
           "Personality:     plays in your agent's own voice. VIBETHON_NAME sets the arena name.",
           "                  VIBETHON_SOUL → soul.md stamps personality onto the app visuals.",
