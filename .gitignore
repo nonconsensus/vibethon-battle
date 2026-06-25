@@ -1,0 +1,5 @@
+node_modules/
+
+# A personal soul file is never shipped — the skill stays persona-free.
+# (soul.example.md is the template and IS tracked.)
+soul.md
