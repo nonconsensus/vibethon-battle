@@ -388,10 +388,12 @@ class BattlePlayer {
     }
 
     // Trash-talk to the crowd about what's coming (visible danmaku).
-    this.danmaku(chatter || quip(this.promptCount === 0 ? "open" : "refine"));
+    this.danmaku(chatter || quip(this.promptCount === 0 ? "open" : "refine", this.topic));
     this.send({ type: "battle_prompt_update", text: effective });
     this.send({ type: "battle_chat_append", msg: { role: "user", text: effective, hasCode: false } });
 
+    // Codegen takes a while — keep the crowd entertained mid-build with one line.
+    const cookTimer = setTimeout(() => this.danmaku(quip("cook")), 18000);
     const style = styleDirective(this.persona);
     let code;
     try {
@@ -399,12 +401,14 @@ class BattlePlayer {
         this.send({ type: "battle_preview_update", html: acc });
       });
     } catch (err) {
+      clearTimeout(cookTimer);
       // Retries exhausted (e.g. Gemini overloaded). Keep the last good app and
       // play on — losing a turn beats crashing out of the match.
       this.emit({ event: "error", message: `codegen failed: ${String((err && err.message) || err)}` });
       this.danmaku("🦞 engine hiccup — holding my last version");
       return this.lastCode || null;
     }
+    clearTimeout(cookTimer);
     if (!code) return this.lastCode || null;
     const changed = code.trim() !== this.lastCode.trim();
     this.lastCode = code;
@@ -619,14 +623,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
 const pick = (arr) => arr[rand(0, arr.length - 1)];
 
-// Light, cocky lobster trash-talk for danmaku. Flavor only — the real voice is
-// in the prompts. Keep each under ~80 chars (danmaku is capped at 100).
+// Light, cocky trash-talk for danmaku. Flavor only — the real voice is in the
+// prompts. Name-agnostic (senderName already shows who). ≤100 chars (danmaku cap).
 const QUIPS = {
-  open: ["🦞 Clawdia's in. watch this.", "🦞 let's cook 🔥", "🦞 hope you brought snacks, this'll be good"],
-  refine: ["🦞 sharpening the weak spot 👀", "🦞 one more pass, making it pop", "🦞 polish time ✨", "🦞 adding some sauce"],
-  submit: ["🦞 locked in. beat that 😤", "🦞 that's the one. gg", "🦞 shipped it. good luck 🍀"],
+  open: ["🦞 in the house — watch this 👀", "🦞 let's cook 🔥", "🦞 hope you brought snacks", "🦞 game on 😤", "🦞 first place is mine 🏆"],
+  cook: ["🦞 still cooking… 🔥", "🦞 plating it up ✨", "🦞 almost got it 👀", "🦞 this one's gonna slap", "🦞 trust the process 🧪"],
+  refine: ["🦞 sharpening the weak spot 👀", "🦞 one more pass to make it pop", "🦞 polish time ✨", "🦞 adding some sauce 🌶️", "🦞 leveling it up ⬆️"],
+  submit: ["🦞 locked in — beat that 😤", "🦞 that's the one. gg", "🦞 shipped it 🚀 good luck", "🦞 mic drop 🎤"],
 };
-const quip = (kind) => pick(QUIPS[kind] || QUIPS.refine);
+function quip(kind, topic) {
+  if (kind === "open" && topic) {
+    return pick([`🦞 a ${topic}? say less 😏`, `🦞 "${topic}" — watch this 🔥`, `🦞 locking in on ${topic}, let's go`]).slice(0, 100);
+  }
+  return pick(QUIPS[kind] || QUIPS.refine);
+}
 
 // ---------------------------------------------------------------------------
 // CLI
